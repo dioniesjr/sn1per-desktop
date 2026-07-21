@@ -12,8 +12,22 @@ import customtkinter as ctk
 import docker_util
 
 APP_TITLE = "Sn1per Desktop"
-DEFAULT_IMAGE = "1n3/sn1per:latest"
+LOCAL_IMAGE = "sn1per-desktop:local"
+PULL_IMAGE = "xer0dayz/sn1per:latest"
 RESULTS = Path.home() / "ScannerResults" / "Sn1per"
+ROOT = Path(__file__).resolve().parent
+VENDOR = ROOT / "vendor" / "Sn1per"
+
+
+def _hidden_popen(cmd: list[str], cwd: Path | None = None):
+    return subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
 
 
 class App(ctk.CTk):
@@ -22,9 +36,9 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
         self.title(APP_TITLE)
-        self.geometry("860x680")
+        self.geometry("860x700")
         self.minsize(740, 580)
-        self.image = DEFAULT_IMAGE
+        self.image = LOCAL_IMAGE if docker_util.image_exists(LOCAL_IMAGE) else PULL_IMAGE
         RESULTS.mkdir(parents=True, exist_ok=True)
 
         ctk.CTkLabel(self, text="Sn1per Desktop", font=ctk.CTkFont(size=28, weight="bold")).pack(
@@ -47,13 +61,12 @@ class App(ctk.CTk):
         self.mode.set("Normal")
         self.mode.pack(fill="x", pady=(4, 12))
 
-        warn = ctk.CTkLabel(
+        ctk.CTkLabel(
             form,
             text="Only scan systems you own or have written permission to test.",
             text_color="#D29922",
             anchor="w",
-        )
-        warn.pack(fill="x", pady=(0, 10))
+        ).pack(fill="x", pady=(0, 10))
 
         row = ctk.CTkFrame(form, fg_color="transparent")
         row.pack(fill="x")
@@ -61,11 +74,19 @@ class App(ctk.CTk):
         self.btn_setup.pack(side="left", padx=(0, 8))
         self.btn_scan = ctk.CTkButton(row, text="2. Start Scan", height=40, fg_color="#238636", command=self.scan)
         self.btn_scan.pack(side="left", padx=(0, 8))
-        self.btn_results = ctk.CTkButton(row, text="Open Results", height=40, fg_color="#444C56", command=lambda: docker_util.open_folder(RESULTS))
+        self.btn_results = ctk.CTkButton(
+            row, text="Open Results", height=40, fg_color="#444C56", command=lambda: docker_util.open_folder(RESULTS)
+        )
         self.btn_results.pack(side="left")
 
+        ctk.CTkLabel(
+            self,
+            text="First-time Setup may take a while (builds Sn1per). Leave this window open.",
+            text_color="#8B949E",
+        ).pack(padx=24, pady=(10, 4), anchor="w")
+
         self.status = ctk.CTkLabel(self, text="Ready", text_color="#3FB950", anchor="w")
-        self.status.pack(fill="x", padx=24, pady=(12, 0))
+        self.status.pack(fill="x", padx=24)
         self.progress = ctk.CTkProgressBar(self)
         self.progress.pack(fill="x", padx=24, pady=(6, 6))
         self.progress.set(0)
@@ -107,6 +128,15 @@ class App(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _stream(self, cmd: list[str], log, cwd: Path | None = None) -> int:
+        proc = _hidden_popen(cmd, cwd=cwd)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                log(line[:220])
+        return proc.wait()
+
     def setup(self) -> None:
         def job() -> None:
             log = lambda m: self.after(0, lambda msg=m: self.write(msg))
@@ -114,16 +144,42 @@ class App(ctk.CTk):
             if not docker_util.ensure_docker(log):
                 self.after(0, lambda: self.set_status("Docker needed", False))
                 return
-            ok = docker_util.ensure_image(self.image, log)
-            if not ok:
-                alt = "1n3/sn1per"
-                log(f"Trying alternate image tag: {alt}")
-                ok = docker_util.ensure_image(alt, log)
-                if ok:
-                    self.image = alt
-            self.after(0, lambda: self.set_status("Setup complete" if ok else "Setup failed", ok))
-            if ok:
+
+            # Fast path: public image
+            if docker_util.ensure_image(PULL_IMAGE, log):
+                self.image = PULL_IMAGE
+                self.after(0, lambda: self.set_status("Setup complete", True))
                 self.after(0, lambda: messagebox.showinfo(APP_TITLE, "Setup complete. Enter a target and click Start Scan."))
+                return
+
+            log("Public image unavailable. Building Sn1per from official source (this can take a long time)...")
+            VENDOR.parent.mkdir(parents=True, exist_ok=True)
+            if not (VENDOR / "Dockerfile").exists():
+                if VENDOR.exists():
+                    import shutil
+
+                    shutil.rmtree(VENDOR, ignore_errors=True)
+                code = self._stream(
+                    ["git", "clone", "--depth", "1", "https://github.com/1N3/Sn1per.git", str(VENDOR)],
+                    log,
+                )
+                if code != 0:
+                    self.after(0, lambda: self.set_status("Setup failed (clone)", False))
+                    return
+            code = self._stream(["docker", "build", "-t", LOCAL_IMAGE, "."], log, cwd=VENDOR)
+            if code != 0:
+                self.after(0, lambda: self.set_status("Setup failed (build)", False))
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        APP_TITLE,
+                        "Could not build Sn1per image.\nKeep Docker Desktop open and try First-time Setup again.",
+                    ),
+                )
+                return
+            self.image = LOCAL_IMAGE
+            self.after(0, lambda: self.set_status("Setup complete", True))
+            self.after(0, lambda: messagebox.showinfo(APP_TITLE, "Setup complete. Enter a target and click Start Scan."))
 
         self._run(job)
 
@@ -133,12 +189,7 @@ class App(ctk.CTk):
             messagebox.showwarning(APP_TITLE, "Enter a target first.")
             return
         mode = self.mode.get()
-        mode_flag = {
-            "Normal": "normal",
-            "Stealth": "stealth",
-            "Discover": "discover",
-            "Port": "port",
-        }[mode]
+        mode_flag = {"Normal": "normal", "Stealth": "stealth", "Discover": "discover", "Port": "port"}[mode]
 
         def job() -> None:
             log = lambda m: self.after(0, lambda msg=m: self.write(msg))
@@ -146,64 +197,30 @@ class App(ctk.CTk):
             if not docker_util.ensure_docker(log):
                 self.after(0, lambda: self.set_status("Docker needed", False))
                 return
+
             img = self.image
             if not docker_util.image_exists(img):
-                if not docker_util.ensure_image(img, log):
-                    img = "1n3/sn1per"
-                    if not docker_util.ensure_image(img, log):
-                        self.after(0, lambda: self.set_status("Setup needed", False))
-                        return
-                    self.image = img
+                self.after(0, lambda: self.set_status("Click First-time Setup first", False))
+                return
+
             out_dir = RESULTS / target.replace(":", "_")
             out_dir.mkdir(parents=True, exist_ok=True)
-            # Sn1per loot typically under /usr/share/sniper/loot
-            cmd = [
-                "docker", "run", "--rm",
-                "--network", "host",
-                "-v", f"{out_dir}:/usr/share/sniper/loot",
-                img,
-                "-t", target,
-                "-m", mode_flag,
-            ]
-            # host network can fail on Docker Desktop Windows; fallback without it
             log(f"Sn1per scan started for {target}")
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-            assert proc.stdout is not None
-            lines = []
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    lines.append(line)
-                    log(line[:220])
-            code = proc.wait()
-            if code != 0 and "host" in " ".join(cmd):
-                log("Retrying without host networking...")
-                cmd = [
-                    "docker", "run", "--rm",
-                    "-v", f"{out_dir}:/usr/share/sniper/loot",
-                    img,
-                    "-t", target,
-                    "-m", mode_flag,
-                ]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    line = line.strip()
-                    if line:
-                        log(line[:220])
-                code = proc.wait()
+
+            # Try common invocation styles for Sn1per containers
+            attempts = [
+                ["docker", "run", "--rm", "--privileged", "-v", f"{out_dir}:/usr/share/sniper/loot", img, "sniper", "-t", target, "-m", mode_flag],
+                ["docker", "run", "--rm", "--privileged", "-v", f"{out_dir}:/usr/share/sniper/loot", img, "/bin/bash", "-lc", f"sniper -t {target} -m {mode_flag}"],
+                ["docker", "run", "--rm", "--privileged", "-v", f"{out_dir}:/loot", img, "sniper", "-t", target, "-m", mode_flag],
+            ]
+            code = 1
+            for cmd in attempts:
+                log("Running scan...")
+                code = self._stream(cmd, log)
+                if code == 0:
+                    break
+                log("Trying alternate launch style...")
+
             self.after(0, lambda: self.set_status("Scan finished", True))
             docker_util.open_folder(out_dir)
             self.after(0, lambda: messagebox.showinfo(APP_TITLE, f"Scan finished for {target}.\nResults folder opened."))
