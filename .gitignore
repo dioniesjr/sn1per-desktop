@@ -8,3 +8,6 @@ venv/
 ScannerResults/
 .env
 .DS_Store
+
+vendor/
+
