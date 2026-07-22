@@ -4,12 +4,14 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 from pathlib import Path
 
 import customtkinter as ctk
 
 import docker_util
+from folder_readable import make_sn1per_readable
 
 APP_TITLE = "Sn1per Desktop"
 LOCAL_IMAGE = "sn1per-desktop:local"
@@ -36,7 +38,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
         self.title(APP_TITLE)
-        self.geometry("860x700")
+        self.geometry("860x740")
         self.minsize(740, 580)
         self.image = LOCAL_IMAGE if docker_util.image_exists(LOCAL_IMAGE) else PULL_IMAGE
         RESULTS.mkdir(parents=True, exist_ok=True)
@@ -77,11 +79,13 @@ class App(ctk.CTk):
         self.btn_results = ctk.CTkButton(
             row, text="Open Results", height=40, fg_color="#444C56", command=lambda: docker_util.open_folder(RESULTS)
         )
-        self.btn_results.pack(side="left")
+        self.btn_results.pack(side="left", padx=(0, 8))
+        self.btn_readable = ctk.CTkButton(row, text="Make Readable Report", height=40, fg_color="#8250DF", command=self.make_readable)
+        self.btn_readable.pack(side="left")
 
         ctk.CTkLabel(
             self,
-            text="First-time Setup may take a while (builds Sn1per). Leave this window open.",
+            text="Open START_HERE_readable.html first. Empty top folders are normal placeholders.",
             text_color="#8B949E",
         ).pack(padx=24, pady=(10, 4), anchor="w")
 
@@ -105,7 +109,7 @@ class App(ctk.CTk):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for b in (self.btn_setup, self.btn_scan, self.btn_results):
+        for b in (self.btn_setup, self.btn_scan, self.btn_results, self.btn_readable):
             b.configure(state=state)
         if busy:
             self.progress.configure(mode="indeterminate")
@@ -137,6 +141,37 @@ class App(ctk.CTk):
                 log(line[:220])
         return proc.wait()
 
+    def _build_readable(self, out_dir: Path, log) -> Path | None:
+        try:
+            report = make_sn1per_readable(out_dir)
+            log(f"Readable report: {report}")
+            docker_util.open_url(report.as_uri())
+            return report
+        except Exception as exc:
+            log(f"Readable report failed: {exc}")
+            return None
+
+    def make_readable(self) -> None:
+        initial = RESULTS
+        dirs = sorted([p for p in RESULTS.glob("*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+        if dirs:
+            initial = dirs[0]
+        chosen = filedialog.askdirectory(title="Choose Sn1per result folder", initialdir=str(initial))
+        if not chosen:
+            return
+        path = Path(chosen)
+
+        def job() -> None:
+            log = lambda m: self.after(0, lambda msg=m: self.write(msg))
+            self.after(0, lambda: self.set_status("Building readable report...", True))
+            report = self._build_readable(path, log)
+            ok = report is not None
+            self.after(0, lambda: self.set_status("Readable report ready" if ok else "Readable report failed", ok))
+            if report:
+                self.after(0, lambda: messagebox.showinfo(APP_TITLE, f"Readable report opened.\n\n{report}"))
+
+        self._run(job)
+
     def setup(self) -> None:
         def job() -> None:
             log = lambda m: self.after(0, lambda msg=m: self.write(msg))
@@ -145,7 +180,6 @@ class App(ctk.CTk):
                 self.after(0, lambda: self.set_status("Docker needed", False))
                 return
 
-            # Fast path: public image
             if docker_util.ensure_image(PULL_IMAGE, log):
                 self.image = PULL_IMAGE
                 self.after(0, lambda: self.set_status("Setup complete", True))
@@ -207,7 +241,6 @@ class App(ctk.CTk):
             out_dir.mkdir(parents=True, exist_ok=True)
             log(f"Sn1per scan started for {target}")
 
-            # Try common invocation styles for Sn1per containers
             attempts = [
                 ["docker", "run", "--rm", "--privileged", "-v", f"{out_dir}:/usr/share/sniper/loot", img, "sniper", "-t", target, "-m", mode_flag],
                 ["docker", "run", "--rm", "--privileged", "-v", f"{out_dir}:/usr/share/sniper/loot", img, "/bin/bash", "-lc", f"sniper -t {target} -m {mode_flag}"],
@@ -221,9 +254,15 @@ class App(ctk.CTk):
                     break
                 log("Trying alternate launch style...")
 
+            report = self._build_readable(out_dir, log)
             self.after(0, lambda: self.set_status("Scan finished", True))
-            docker_util.open_folder(out_dir)
-            self.after(0, lambda: messagebox.showinfo(APP_TITLE, f"Scan finished for {target}.\nResults folder opened."))
+            # Open workspace if present, else loot root
+            open_path = out_dir / "workspace" / target
+            docker_util.open_folder(open_path if open_path.exists() else out_dir)
+            msg = f"Scan finished for {target}."
+            if report:
+                msg += f"\n\nOpen this first:\n{report.name}"
+            self.after(0, lambda: messagebox.showinfo(APP_TITLE, msg))
 
         self._run(job)
 
